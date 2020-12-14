@@ -1,0 +1,19 @@
+[package]
+name = "safegold"
+version = "0.1.0"
+authors = ["Abhyudit Jain <abhyuditjain@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+reqwest = { version = "0.10.9", features = ["json"] }
+tokio = { version = "0.2", features = ["full"] }
+serde = { version = "1.0.118", features = ["derive"] }
+serde_json = "1.0.60"
+serde-aux = "1.1.0"
+thiserror = "1.0.22"
+url = "2.2.0"
+rust_decimal = "1.8.1"
+chrono = { version = "0.4.19", features = ["serde"], default-features = true }
+lazy_static = "1.4.0"
