@@ -121,6 +121,33 @@ pub struct BuyStatus {
     created_at: DateTime<Utc>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
+pub struct TransactionList {
+    transactions: Vec<Transaction>,
+    meta: TransactionListMeta,
+}
+
+#[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
+pub struct TransactionListMeta {
+    previous: Option<String>,
+    next: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
+pub struct Transaction {
+    r#type: String,
+    tx_id: usize,
+    rate: Decimal,
+    gold_amount: Decimal,
+    buy_price: Option<Decimal>,
+    sell_price: Option<Decimal>,
+    pre_gst_buy_price: Option<Decimal>,
+    gst_amount: Option<Decimal>,
+    user_id: usize,
+    #[serde(with = "utils::custom_date_time_format")]
+    tx_date: DateTime<Utc>,
+}
+
 pub struct SafeGold {
     base_url: reqwest::Url,
     client: reqwest::Client,
@@ -142,7 +169,7 @@ impl SafeGold {
         })
     }
 
-    pub async fn get_user(&self, id: &str) -> Result<User, SafeGoldError> {
+    pub async fn get_user(&self, id: usize) -> Result<User, SafeGoldError> {
         let url: Url = format!("{}v1/users/{}", self.base_url, id).parse()?;
         let r = self.client.get(url).send().await?;
         match r.status().as_u16() {
@@ -169,7 +196,7 @@ impl SafeGold {
 
     pub async fn buy_verify(
         &self,
-        user_id: &str,
+        user_id: usize,
         buy_verify: &BuyVerifyRequest,
     ) -> Result<BuyVerify, SafeGoldError> {
         let url: Url = format!("{}v4/users/{}/buy-gold-verify", self.base_url, user_id).parse()?;
@@ -185,7 +212,7 @@ impl SafeGold {
 
     pub async fn buy_confirm(
         &self,
-        user_id: &str,
+        user_id: usize,
         buy_confirm: &BuyConfirmRequest,
     ) -> Result<BuyConfirm, SafeGoldError> {
         let url: Url = format!("{}v1/users/{}/buy-gold-confirm", self.base_url, user_id).parse()?;
@@ -212,6 +239,27 @@ impl SafeGold {
         }
     }
 
+    pub async fn get_user_transactions(
+        &self,
+        user_id: usize,
+        page: Option<usize>,
+    ) -> Result<TransactionList, SafeGoldError> {
+        let page = match page {
+            Some(x) if x > 0 => x,
+            None | Some(0) => 1,
+            _ => unreachable!(),
+        };
+        let url: Url = format!("{}/v1/users/{}/transactions", self.base_url, user_id).parse()?;
+        let r = self.client.get(url).query(&[("page", page)]).send().await?;
+        match r.status().as_u16() {
+            200 => Ok(r.json::<TransactionList>().await?),
+            400 => Err(Self::handle_bad_request_error(
+                r.json::<SafeGoldClientError>().await?,
+            )),
+            _ => Err(SafeGoldError::ServiceUnavailable),
+        }
+    }
+
     fn handle_bad_request_error(r: SafeGoldClientError) -> SafeGoldError {
         match r.code {
             1 => SafeGoldError::MissingRequiredInformation(r.message),
@@ -233,7 +281,7 @@ mod tests {
     use rust_decimal::{Decimal, RoundingStrategy};
     use std::ops::Mul;
 
-    const USER_ID: &str = "275567";
+    const USER_ID: usize = 275567;
     const OLD_TX_ID: usize = 1288969;
 
     lazy_static! {
@@ -255,7 +303,7 @@ mod tests {
         let user_response = safegold.get_user(USER_ID).await;
         assert!(user_response.is_ok());
 
-        let user_response = safegold.get_user("275566").await;
+        let user_response = safegold.get_user(275566).await;
         assert!(user_response.is_err());
     }
 
@@ -358,7 +406,7 @@ mod tests {
             date: Utc::now().naive_utc().date(),
             tx_id: buy_verify.tx_id,
         };
-        let buy_confirm = safegold.buy_confirm("12345", &buy_confirm_request).await;
+        let buy_confirm = safegold.buy_confirm(12345, &buy_confirm_request).await;
         assert!(buy_confirm.is_err());
         assert!(matches!(
             buy_confirm.unwrap_err(),
@@ -368,7 +416,7 @@ mod tests {
         // this user doesn't exist
         let buy_verify = safegold
             .buy_verify(
-                "275566",
+                275566,
                 &BuyVerifyRequest {
                     buy_price: buy_price_response
                         .current_price
@@ -385,7 +433,7 @@ mod tests {
             date: Utc::now().naive_utc().date(),
             tx_id: buy_verify.tx_id,
         };
-        let buy_confirm = safegold.buy_confirm("275566", &buy_confirm_request).await;
+        let buy_confirm = safegold.buy_confirm(275566, &buy_confirm_request).await;
         assert!(buy_confirm.is_err());
         assert!(matches!(
             buy_confirm.unwrap_err(),
@@ -452,5 +500,41 @@ mod tests {
             buy_status_response.err().unwrap(),
             SafeGoldError::TransactionNotFound(11111111)
         ));
+    }
+
+    #[tokio::test]
+    async fn test_get_user_transactions() {
+        let safegold = SafeGold::new(&BASE_URL, &TOKEN).unwrap();
+        let user_transactions_response_page_none =
+            safegold.get_user_transactions(USER_ID, None).await;
+
+        assert!(user_transactions_response_page_none.is_ok());
+        let user_transactions = user_transactions_response_page_none.unwrap();
+        assert!(!user_transactions.transactions.is_empty());
+        assert!(user_transactions.meta.previous.is_none());
+        assert!(user_transactions.meta.next.is_some());
+
+        let user_transactions_response_page_0 =
+            safegold.get_user_transactions(USER_ID, Some(0)).await;
+        assert!(user_transactions_response_page_0.is_ok());
+        let user_transactions = user_transactions_response_page_0.unwrap();
+        assert!(!user_transactions.transactions.is_empty());
+        assert!(user_transactions.meta.previous.is_none());
+        assert!(user_transactions.meta.next.is_some());
+
+        let user_transactions_response_page_1 =
+            safegold.get_user_transactions(USER_ID, Some(1)).await;
+        assert!(user_transactions_response_page_1.is_ok());
+        let user_transactions = user_transactions_response_page_1.unwrap();
+        assert!(!user_transactions.transactions.is_empty());
+        assert!(user_transactions.meta.previous.is_none());
+        assert!(user_transactions.meta.next.is_some());
+
+        let user_transactions_response_page_2 =
+            safegold.get_user_transactions(USER_ID, Some(2)).await;
+        assert!(user_transactions_response_page_2.is_ok());
+        let user_transactions = user_transactions_response_page_2.unwrap();
+        assert!(user_transactions.meta.previous.is_some());
+        assert!(user_transactions.meta.next.is_some());
     }
 }
