@@ -1,12 +1,12 @@
 mod utils;
 
+use chrono::{DateTime, NaiveDate, Utc};
 use reqwest::header::HeaderMap;
 use reqwest::Url;
-use serde::{Serialize, Deserialize};
-use thiserror::Error;
 use rust_decimal::Decimal;
-use chrono::{DateTime, Utc, NaiveDate};
+use serde::{Deserialize, Serialize};
 use serde_aux::prelude::deserialize_number_from_string;
+use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum SafeGoldError {
@@ -16,11 +16,17 @@ pub enum SafeGoldError {
     #[error("Bad Request error with message: {0}")]
     BadRequest(String),
 
+    #[error("Missing required information: {0}")]
+    MissingRequiredInformation(String),
+
     #[error("Vendor ID and User ID mismatch")]
     VendorUserMismatch,
 
     #[error("Invalid transaction ID")]
     InvalidTransaction,
+
+    #[error("Transaction not found with ID: {0}")]
+    TransactionNotFound(usize),
 
     #[error("User Id Missing In Transactions")]
     UserIdMissingInTransaction,
@@ -106,6 +112,15 @@ pub struct BuyConfirm {
     invoice_id: String,
 }
 
+#[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
+pub struct BuyStatus {
+    status: usize,
+    realization_status: usize,
+    payment_status: usize,
+    #[serde(with = "utils::custom_date_time_format")]
+    created_at: DateTime<Utc>,
+}
+
 pub struct SafeGold {
     base_url: reqwest::Url,
     client: reqwest::Client,
@@ -115,17 +130,27 @@ impl SafeGold {
     pub fn new(base_url: &str, token: &str) -> Result<Self, SafeGoldError> {
         let base_url = Url::parse(base_url)?;
         let mut headers = HeaderMap::new();
-        headers.insert("Authorization", format!("Bearer {}", token).parse().unwrap());
-        Ok(Self { base_url, client: reqwest::Client::builder().default_headers(headers).build()? })
+        headers.insert(
+            "Authorization",
+            format!("Bearer {}", token).parse().unwrap(),
+        );
+        Ok(Self {
+            base_url,
+            client: reqwest::Client::builder()
+                .default_headers(headers)
+                .build()?,
+        })
     }
 
     pub async fn get_user(&self, id: &str) -> Result<User, SafeGoldError> {
         let url: Url = format!("{}v1/users/{}", self.base_url, id).parse()?;
         let r = self.client.get(url).send().await?;
-        match r.status() {
-            x if x == 200 => Ok(r.json::<User>().await?),
-            x if x == 404 => Err(SafeGoldError::UserDoesNotExist(id.to_string())),
-            // x if x >= 400 && x < 500 => SafeGoldError::UndefinedError(),
+        match r.status().as_u16() {
+            200 => Ok(r.json::<User>().await?),
+            400 => Err(Self::handle_bad_request_error(
+                r.json::<SafeGoldClientError>().await?,
+            )),
+            404 => Err(SafeGoldError::UserDoesNotExist(id.to_string())),
             _ => Err(SafeGoldError::ServiceUnavailable),
         }
     }
@@ -133,62 +158,87 @@ impl SafeGold {
     pub async fn get_buy_price(&self) -> Result<BuyPrice, SafeGoldError> {
         let url: Url = format!("{}v1/buy-price", self.base_url).parse().unwrap();
         let r = self.client.get(url).send().await?;
-        match r.status() {
-            x if x == 200 => Ok(r.json::<BuyPrice>().await?),
+        match r.status().as_u16() {
+            200 => Ok(r.json::<BuyPrice>().await?),
+            400 => Err(Self::handle_bad_request_error(
+                r.json::<SafeGoldClientError>().await?,
+            )),
             _ => Err(SafeGoldError::ServiceUnavailable),
         }
     }
 
-    pub async fn buy_verify(&self, user_id: &str, buy_verify: &BuyVerifyRequest) -> Result<BuyVerify, SafeGoldError> {
+    pub async fn buy_verify(
+        &self,
+        user_id: &str,
+        buy_verify: &BuyVerifyRequest,
+    ) -> Result<BuyVerify, SafeGoldError> {
         let url: Url = format!("{}v4/users/{}/buy-gold-verify", self.base_url, user_id).parse()?;
         let r = self.client.post(url).json(buy_verify).send().await?;
-        match r.status() {
-            x if x == 200 => Ok(r.json::<BuyVerify>().await?),
-            x if x == 400 => {
-                let r = r.json::<SafeGoldClientError>().await?;
-                match r.code {
-                    x if x == 4 => Err(SafeGoldError::GoldAmountDoesNotMatch),
-                    x if x == 8 => Err(SafeGoldError::InvalidRate),
-                    _ => Err(SafeGoldError::BadRequest(r.message)),
-                }
-            }
-            _ => Err(SafeGoldError::ServiceUnavailable)
+        match r.status().as_u16() {
+            200 => Ok(r.json::<BuyVerify>().await?),
+            400 => Err(Self::handle_bad_request_error(
+                r.json::<SafeGoldClientError>().await?,
+            )),
+            _ => Err(SafeGoldError::ServiceUnavailable),
         }
     }
 
-    pub async fn buy_confirm(&self, user_id: &str, buy_confirm: &BuyConfirmRequest) -> Result<BuyConfirm, SafeGoldError> {
+    pub async fn buy_confirm(
+        &self,
+        user_id: &str,
+        buy_confirm: &BuyConfirmRequest,
+    ) -> Result<BuyConfirm, SafeGoldError> {
         let url: Url = format!("{}v1/users/{}/buy-gold-confirm", self.base_url, user_id).parse()?;
         let r = self.client.post(url).json(buy_confirm).send().await?;
-        match r.status() {
-            x if x == 200 => Ok(r.json::<BuyConfirm>().await?),
-            x if x == 400 => {
-                let r = r.json::<SafeGoldClientError>().await?;
-                match r.code {
-                    x if x == 2 => Err(SafeGoldError::InvalidTransaction),
-                    x if x == 3 => Err(SafeGoldError::VendorUserMismatch),
-                    x if x == 5 => Err(SafeGoldError::UserIdMissingInTransaction),
-                    _ => Err(SafeGoldError::BadRequest(r.message)),
-                }
-            }
-            _ => Err(SafeGoldError::ServiceUnavailable)
+        match r.status().as_u16() {
+            200 => Ok(r.json::<BuyConfirm>().await?),
+            400 => Err(Self::handle_bad_request_error(
+                r.json::<SafeGoldClientError>().await?,
+            )),
+            _ => Err(SafeGoldError::ServiceUnavailable),
+        }
+    }
+
+    pub async fn buy_status(&self, tx_id: usize) -> Result<BuyStatus, SafeGoldError> {
+        let url: Url = format!("{}v1/buy-gold/{}/order-status", self.base_url, tx_id).parse()?;
+        let r = self.client.get(url).send().await?;
+        match r.status().as_u16() {
+            200 => Ok(r.json::<BuyStatus>().await?),
+            400 => Err(Self::handle_bad_request_error(
+                r.json::<SafeGoldClientError>().await?,
+            )),
+            404 => Err(SafeGoldError::TransactionNotFound(tx_id)),
+            _ => Err(SafeGoldError::ServiceUnavailable),
+        }
+    }
+
+    fn handle_bad_request_error(r: SafeGoldClientError) -> SafeGoldError {
+        match r.code {
+            1 => SafeGoldError::MissingRequiredInformation(r.message),
+            2 => SafeGoldError::InvalidTransaction,
+            3 => SafeGoldError::VendorUserMismatch,
+            4 => SafeGoldError::GoldAmountDoesNotMatch,
+            5 => SafeGoldError::UserIdMissingInTransaction,
+            8 => SafeGoldError::InvalidRate,
+            _ => SafeGoldError::BadRequest(r.message),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::{BuyConfirmRequest, BuyVerifyRequest, SafeGold, SafeGoldError};
+    use chrono::Utc;
     use lazy_static::lazy_static;
-    use crate::{SafeGold, BuyVerifyRequest, SafeGoldError, BuyConfirmRequest};
     use rust_decimal::{Decimal, RoundingStrategy};
     use std::ops::Mul;
-    use chrono::Utc;
 
     const USER_ID: &str = "275567";
+    const OLD_TX_ID: usize = 1288969;
 
     lazy_static! {
-       static ref BASE_URL: String = std::env::var("BASE_URL").unwrap();
-       static ref TOKEN: String = std::env::var("TOKEN").unwrap();
-       static ref SAFEGOLD: SafeGold = SafeGold::new(&BASE_URL, &TOKEN).unwrap();
+        static ref BASE_URL: String = std::env::var("BASE_URL").unwrap();
+        static ref TOKEN: String = std::env::var("TOKEN").unwrap();
     }
 
     #[test]
@@ -201,16 +251,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_user() {
-        let user_response = SAFEGOLD.get_user(USER_ID).await;
+        let safegold = SafeGold::new(&BASE_URL, &TOKEN).unwrap();
+        let user_response = safegold.get_user(USER_ID).await;
         assert!(user_response.is_ok());
 
-        let user_response = SAFEGOLD.get_user("275566").await;
+        let user_response = safegold.get_user("275566").await;
         assert!(user_response.is_err());
     }
 
     #[tokio::test]
     async fn test_get_buy_price() {
-        let buy_price_response = SAFEGOLD.get_buy_price().await;
+        let safegold = SafeGold::new(&BASE_URL, &TOKEN).unwrap();
+        let buy_price_response = safegold.get_buy_price().await;
         assert!(buy_price_response.is_ok());
 
         let bp = buy_price_response.unwrap();
@@ -219,79 +271,186 @@ mod tests {
 
     #[tokio::test]
     async fn test_buy_verify() {
-        let buy_price_response = SAFEGOLD.get_buy_price().await.unwrap();
+        let safegold = SafeGold::new(&BASE_URL, &TOKEN).unwrap();
+        let buy_price_response = safegold.get_buy_price().await.unwrap();
 
         let buy_verify_request = BuyVerifyRequest {
-            buy_price: buy_price_response.current_price.mul(Decimal::new(103, 2)).round_dp_with_strategy(2, RoundingStrategy::RoundUp),
+            buy_price: buy_price_response
+                .current_price
+                .mul(Decimal::new(103, 2))
+                .round_dp_with_strategy(2, RoundingStrategy::RoundUp),
             gold_amount: Decimal::new(1, 0).round_dp_with_strategy(4, RoundingStrategy::RoundDown),
             rate_id: buy_price_response.rate_id,
         };
-        let buy_verify = SAFEGOLD.buy_verify(USER_ID, &buy_verify_request).await;
+        let buy_verify = safegold.buy_verify(USER_ID, &buy_verify_request).await;
         assert!(buy_verify.is_ok());
 
         let buy_verify_request = BuyVerifyRequest {
-            buy_price: buy_price_response.current_price.mul(Decimal::new(103, 2)).round_dp_with_strategy(2, RoundingStrategy::RoundUp),
+            buy_price: buy_price_response
+                .current_price
+                .mul(Decimal::new(103, 2))
+                .round_dp_with_strategy(2, RoundingStrategy::RoundUp),
             gold_amount: Decimal::new(1, 1).round_dp_with_strategy(4, RoundingStrategy::RoundDown),
             rate_id: buy_price_response.rate_id,
         };
-        let buy_verify = SAFEGOLD.buy_verify(USER_ID, &buy_verify_request).await;
+        let buy_verify = safegold.buy_verify(USER_ID, &buy_verify_request).await;
         assert!(buy_verify.is_err());
-        assert!(matches!(buy_verify.err().unwrap(), SafeGoldError::GoldAmountDoesNotMatch));
+        assert!(matches!(
+            buy_verify.err().unwrap(),
+            SafeGoldError::GoldAmountDoesNotMatch
+        ));
 
         let buy_verify_request = BuyVerifyRequest {
-            buy_price: buy_price_response.current_price.mul(Decimal::new(103, 2)).round_dp_with_strategy(2, RoundingStrategy::RoundUp),
+            buy_price: buy_price_response
+                .current_price
+                .mul(Decimal::new(103, 2))
+                .round_dp_with_strategy(2, RoundingStrategy::RoundUp),
             gold_amount: Decimal::new(1, 0).round_dp_with_strategy(4, RoundingStrategy::RoundDown),
             rate_id: buy_price_response.rate_id - 100,
         };
-        let buy_verify = SAFEGOLD.buy_verify(USER_ID, &buy_verify_request).await;
+        let buy_verify = safegold.buy_verify(USER_ID, &buy_verify_request).await;
         assert!(buy_verify.is_err());
-        assert!(matches!(buy_verify.err().unwrap(), SafeGoldError::InvalidRate));
+        assert!(matches!(
+            buy_verify.err().unwrap(),
+            SafeGoldError::InvalidRate
+        ));
     }
 
     #[tokio::test]
     async fn test_buy_confirm() {
-        let buy_price_response = SAFEGOLD.get_buy_price().await.unwrap();
-        let buy_verify = SAFEGOLD.buy_verify(USER_ID, &BuyVerifyRequest {
-            buy_price: buy_price_response.current_price.mul(Decimal::new(103, 2)).round_dp_with_strategy(2, RoundingStrategy::RoundUp),
-            gold_amount: Decimal::new(1, 0).round_dp_with_strategy(4, RoundingStrategy::RoundDown),
-            rate_id: buy_price_response.rate_id,
-        }).await.unwrap();
+        let safegold = SafeGold::new(&BASE_URL, &TOKEN).unwrap();
+        let buy_price_response = safegold.get_buy_price().await.unwrap();
+        let buy_verify = safegold
+            .buy_verify(
+                USER_ID,
+                &BuyVerifyRequest {
+                    buy_price: buy_price_response
+                        .current_price
+                        .mul(Decimal::new(103, 2))
+                        .round_dp_with_strategy(2, RoundingStrategy::RoundUp),
+                    gold_amount: Decimal::new(1, 0)
+                        .round_dp_with_strategy(4, RoundingStrategy::RoundDown),
+                    rate_id: buy_price_response.rate_id,
+                },
+            )
+            .await
+            .unwrap();
 
         let buy_confirm_request = BuyConfirmRequest {
             date: Utc::now().naive_utc().date(),
             tx_id: buy_verify.tx_id,
         };
-        let buy_confirm = SAFEGOLD.buy_confirm(USER_ID, &buy_confirm_request).await;
+        let buy_confirm = safegold.buy_confirm(USER_ID, &buy_confirm_request).await;
         assert!(buy_confirm.is_ok());
 
         let buy_confirm_request = BuyConfirmRequest {
             date: Utc::now().naive_utc().date(),
             tx_id: 11111111111,
         };
-        let buy_confirm = SAFEGOLD.buy_confirm(USER_ID, &buy_confirm_request).await;
+        let buy_confirm = safegold.buy_confirm(USER_ID, &buy_confirm_request).await;
         assert!(buy_confirm.is_err());
-        assert!(matches!(buy_confirm.unwrap_err(), SafeGoldError::InvalidTransaction));
+        assert!(matches!(
+            buy_confirm.unwrap_err(),
+            SafeGoldError::InvalidTransaction
+        ));
 
         let buy_confirm_request = BuyConfirmRequest {
             date: Utc::now().naive_utc().date(),
             tx_id: buy_verify.tx_id,
         };
-        let buy_confirm = SAFEGOLD.buy_confirm("12345", &buy_confirm_request).await;
+        let buy_confirm = safegold.buy_confirm("12345", &buy_confirm_request).await;
         assert!(buy_confirm.is_err());
-        assert!(matches!(buy_confirm.unwrap_err(), SafeGoldError::VendorUserMismatch));
+        assert!(matches!(
+            buy_confirm.unwrap_err(),
+            SafeGoldError::VendorUserMismatch
+        ));
 
         // this user doesn't exist
-        let buy_verify = SAFEGOLD.buy_verify("275566", &BuyVerifyRequest {
-            buy_price: buy_price_response.current_price.mul(Decimal::new(103, 2)).round_dp_with_strategy(2, RoundingStrategy::RoundUp),
-            gold_amount: Decimal::new(1, 0).round_dp_with_strategy(4, RoundingStrategy::RoundDown),
-            rate_id: buy_price_response.rate_id,
-        }).await.unwrap();
+        let buy_verify = safegold
+            .buy_verify(
+                "275566",
+                &BuyVerifyRequest {
+                    buy_price: buy_price_response
+                        .current_price
+                        .mul(Decimal::new(103, 2))
+                        .round_dp_with_strategy(2, RoundingStrategy::RoundUp),
+                    gold_amount: Decimal::new(1, 0)
+                        .round_dp_with_strategy(4, RoundingStrategy::RoundDown),
+                    rate_id: buy_price_response.rate_id,
+                },
+            )
+            .await
+            .unwrap();
         let buy_confirm_request = BuyConfirmRequest {
             date: Utc::now().naive_utc().date(),
             tx_id: buy_verify.tx_id,
         };
-        let buy_confirm = SAFEGOLD.buy_confirm("275566", &buy_confirm_request).await;
+        let buy_confirm = safegold.buy_confirm("275566", &buy_confirm_request).await;
         assert!(buy_confirm.is_err());
-        assert!(matches!(buy_confirm.unwrap_err(), SafeGoldError::UserIdMissingInTransaction));
+        assert!(matches!(
+            buy_confirm.unwrap_err(),
+            SafeGoldError::UserIdMissingInTransaction
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_buy_status() {
+        let safegold = SafeGold::new(&BASE_URL, &TOKEN).unwrap();
+        let buy_price_response = safegold.get_buy_price().await.unwrap();
+        let buy_verify = safegold
+            .buy_verify(
+                USER_ID,
+                &BuyVerifyRequest {
+                    buy_price: buy_price_response
+                        .current_price
+                        .mul(Decimal::new(103, 2))
+                        .round_dp_with_strategy(2, RoundingStrategy::RoundUp),
+                    gold_amount: Decimal::new(1, 0)
+                        .round_dp_with_strategy(4, RoundingStrategy::RoundDown),
+                    rate_id: buy_price_response.rate_id,
+                },
+            )
+            .await
+            .unwrap();
+
+        let buy_status_response = safegold.buy_status(buy_verify.tx_id).await;
+        assert!(buy_status_response.is_ok());
+        assert_eq!(buy_status_response.unwrap().status, 0);
+
+        let _buy_confirm = safegold
+            .buy_confirm(
+                USER_ID,
+                &BuyConfirmRequest {
+                    tx_id: buy_verify.tx_id,
+                    date: Utc::now().naive_utc().date(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let buy_status_response = safegold.buy_status(buy_verify.tx_id).await;
+        assert!(buy_status_response.is_ok());
+        assert_eq!(buy_status_response.unwrap().status, 1);
+
+        let buy_confirm = safegold
+            .buy_confirm(
+                USER_ID,
+                &BuyConfirmRequest {
+                    tx_id: OLD_TX_ID,
+                    date: Utc::now().naive_utc().date(),
+                },
+            )
+            .await;
+        assert!(buy_confirm.is_err());
+        let buy_status_response = safegold.buy_status(OLD_TX_ID).await;
+        assert!(buy_status_response.is_ok());
+        assert_eq!(buy_status_response.unwrap().status, 2);
+
+        let buy_status_response = safegold.buy_status(11111111).await;
+        assert!(buy_status_response.is_err());
+        assert!(matches!(
+            buy_status_response.err().unwrap(),
+            SafeGoldError::TransactionNotFound(11111111)
+        ));
     }
 }
