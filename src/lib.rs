@@ -505,15 +505,17 @@ mod tests {
     #[tokio::test]
     async fn test_get_user_transactions() {
         let safegold = SafeGold::new(&BASE_URL, &TOKEN).unwrap();
+
+        // Page None should get page 1
         let user_transactions_response_page_none =
             safegold.get_user_transactions(USER_ID, None).await;
-
         assert!(user_transactions_response_page_none.is_ok());
         let user_transactions = user_transactions_response_page_none.unwrap();
         assert!(!user_transactions.transactions.is_empty());
         assert!(user_transactions.meta.previous.is_none());
         assert!(user_transactions.meta.next.is_some());
 
+        // Page 0 should get page 1
         let user_transactions_response_page_0 =
             safegold.get_user_transactions(USER_ID, Some(0)).await;
         assert!(user_transactions_response_page_0.is_ok());
@@ -522,6 +524,7 @@ mod tests {
         assert!(user_transactions.meta.previous.is_none());
         assert!(user_transactions.meta.next.is_some());
 
+        // Page 1 should get page 1
         let user_transactions_response_page_1 =
             safegold.get_user_transactions(USER_ID, Some(1)).await;
         assert!(user_transactions_response_page_1.is_ok());
@@ -530,6 +533,24 @@ mod tests {
         assert!(user_transactions.meta.previous.is_none());
         assert!(user_transactions.meta.next.is_some());
 
+        assert_eq!(
+            user_transactions
+                .transactions
+                .iter()
+                .filter(|x| x.r#type == "buy")
+                .count(),
+            33
+        );
+        assert_eq!(
+            user_transactions
+                .transactions
+                .iter()
+                .filter(|x| x.r#type == "sell")
+                .count(),
+            5
+        );
+
+        // Page 2 should get page 2
         let user_transactions_response_page_2 =
             safegold.get_user_transactions(USER_ID, Some(2)).await;
         assert!(user_transactions_response_page_2.is_ok());
