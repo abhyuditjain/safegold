@@ -98,7 +98,7 @@ pub struct BuyVerify {
     pre_gst_buy_price: Decimal,
     gst_amount: Decimal,
     #[serde(deserialize_with = "deserialize_number_from_string")]
-    user_id: String,
+    user_id: usize,
 }
 
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
