@@ -244,11 +244,7 @@ impl SafeGold {
         user_id: usize,
         page: Option<usize>,
     ) -> Result<TransactionList, SafeGoldError> {
-        let page = match page {
-            Some(x) if x > 0 => x,
-            None | Some(0) => 1,
-            _ => unreachable!(),
-        };
+        let page = page.unwrap_or(1).max(1);
         let url: Url = format!("{}/v1/users/{}/transactions", self.base_url, user_id).parse()?;
         let r = self.client.get(url).query(&[("page", page)]).send().await?;
         match r.status().as_u16() {
