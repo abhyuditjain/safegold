@@ -239,13 +239,6 @@ impl SafeGold {
         }
     }
 
-    fn handle_register_user_bad_request(r: SafeGoldClientError) -> SafeGoldError {
-        match r.code {
-            1 => SafeGoldError::MissingRequiredInformation(r.message),
-            _ => SafeGoldError::BadRequest(r.message),
-        }
-    }
-
     pub async fn get_user(&self, id: usize) -> Result<User, SafeGoldError> {
         let url: Url = format!("{}v1/users/{}", self.base_url, id).parse()?;
         let r = self.client.get(url).send().await?;
@@ -256,13 +249,6 @@ impl SafeGold {
             )),
             404 => Err(SafeGoldError::UserDoesNotExist(id.to_string())),
             _ => Err(SafeGoldError::ServiceUnavailable),
-        }
-    }
-
-    fn handle_get_user_bad_request(r: SafeGoldClientError) -> SafeGoldError {
-        match r.code {
-            1 => SafeGoldError::UserDoesNotExist(r.message),
-            _ => SafeGoldError::BadRequest(r.message),
         }
     }
 
@@ -306,18 +292,6 @@ impl SafeGold {
         }
     }
 
-    fn handle_buy_verify_bad_request(r: SafeGoldClientError) -> SafeGoldError {
-        match r.code {
-            1 => SafeGoldError::MissingRequiredInformation(r.message),
-            2 => SafeGoldError::RateMismatch,
-            4 => SafeGoldError::GoldAmountDoesNotMatch,
-            6 => SafeGoldError::BalanceAboveKYCLimit,
-            7 => SafeGoldError::BalanceAbovePANLimit,
-            8 => SafeGoldError::InvalidRate,
-            _ => SafeGoldError::BadRequest(r.message),
-        }
-    }
-
     pub async fn sell_verify(
         &self,
         user_id: usize,
@@ -331,18 +305,6 @@ impl SafeGold {
                 r.json::<SafeGoldClientError>().await?,
             )),
             _ => Err(SafeGoldError::ServiceUnavailable),
-        }
-    }
-
-    fn handle_sell_verify_bad_request(r: SafeGoldClientError) -> SafeGoldError {
-        match r.code {
-            1 => SafeGoldError::MissingRequiredInformation(r.message),
-            2 => SafeGoldError::RateMismatch,
-            3 => SafeGoldError::UserDoesNotExist(r.message),
-            4 => SafeGoldError::InsufficientGoldBalance,
-            5 => SafeGoldError::GoldAmountDoesNotMatch,
-            6 => SafeGoldError::InvalidRate,
-            _ => SafeGoldError::BadRequest(r.message),
         }
     }
 
@@ -362,16 +324,6 @@ impl SafeGold {
         }
     }
 
-    fn handle_buy_confirm_bad_request(r: SafeGoldClientError) -> SafeGoldError {
-        match r.code {
-            1 => SafeGoldError::MissingRequiredInformation(r.message),
-            2 => SafeGoldError::InvalidTransaction,
-            3 => SafeGoldError::VendorUserMismatch,
-            5 => SafeGoldError::UserIdMissingInTransaction,
-            _ => SafeGoldError::BadRequest(r.message),
-        }
-    }
-
     pub async fn buy_status(&self, tx_id: usize) -> Result<BuyStatus, SafeGoldError> {
         let url: Url = format!("{}v1/buy-gold/{}/order-status", self.base_url, tx_id).parse()?;
         let r = self.client.get(url).send().await?;
@@ -382,13 +334,6 @@ impl SafeGold {
             )),
             404 => Err(SafeGoldError::TransactionNotFound(tx_id)),
             _ => Err(SafeGoldError::ServiceUnavailable),
-        }
-    }
-
-    fn handle_buy_status_bad_request(r: SafeGoldClientError) -> SafeGoldError {
-        match r.code {
-            1 => SafeGoldError::MissingRequiredInformation(r.message),
-            _ => SafeGoldError::BadRequest(r.message),
         }
     }
 
@@ -409,13 +354,6 @@ impl SafeGold {
         }
     }
 
-    fn handle_get_user_transactions_bad_request(r: SafeGoldClientError) -> SafeGoldError {
-        match r.code {
-            1 => SafeGoldError::MissingRequiredInformation(r.message),
-            _ => SafeGoldError::BadRequest(r.message),
-        }
-    }
-
     pub async fn get_invoice(&self, tx_id: usize) -> Result<Invoice, SafeGoldError> {
         let url: Url =
             format!("{}/v1/transactions/{}/fetch-invoice", self.base_url, tx_id).parse()?;
@@ -428,7 +366,64 @@ impl SafeGold {
             _ => Err(SafeGoldError::ServiceUnavailable),
         }
     }
+}
 
+impl SafeGold {
+    fn handle_register_user_bad_request(r: SafeGoldClientError) -> SafeGoldError {
+        match r.code {
+            1 => SafeGoldError::MissingRequiredInformation(r.message),
+            _ => SafeGoldError::BadRequest(r.message),
+        }
+    }
+    fn handle_get_user_bad_request(r: SafeGoldClientError) -> SafeGoldError {
+        match r.code {
+            1 => SafeGoldError::UserDoesNotExist(r.message),
+            _ => SafeGoldError::BadRequest(r.message),
+        }
+    }
+    fn handle_buy_verify_bad_request(r: SafeGoldClientError) -> SafeGoldError {
+        match r.code {
+            1 => SafeGoldError::MissingRequiredInformation(r.message),
+            2 => SafeGoldError::RateMismatch,
+            4 => SafeGoldError::GoldAmountDoesNotMatch,
+            6 => SafeGoldError::BalanceAboveKYCLimit,
+            7 => SafeGoldError::BalanceAbovePANLimit,
+            8 => SafeGoldError::InvalidRate,
+            _ => SafeGoldError::BadRequest(r.message),
+        }
+    }
+    fn handle_sell_verify_bad_request(r: SafeGoldClientError) -> SafeGoldError {
+        match r.code {
+            1 => SafeGoldError::MissingRequiredInformation(r.message),
+            2 => SafeGoldError::RateMismatch,
+            3 => SafeGoldError::UserDoesNotExist(r.message),
+            4 => SafeGoldError::InsufficientGoldBalance,
+            5 => SafeGoldError::GoldAmountDoesNotMatch,
+            6 => SafeGoldError::InvalidRate,
+            _ => SafeGoldError::BadRequest(r.message),
+        }
+    }
+    fn handle_buy_confirm_bad_request(r: SafeGoldClientError) -> SafeGoldError {
+        match r.code {
+            1 => SafeGoldError::MissingRequiredInformation(r.message),
+            2 => SafeGoldError::InvalidTransaction,
+            3 => SafeGoldError::VendorUserMismatch,
+            5 => SafeGoldError::UserIdMissingInTransaction,
+            _ => SafeGoldError::BadRequest(r.message),
+        }
+    }
+    fn handle_buy_status_bad_request(r: SafeGoldClientError) -> SafeGoldError {
+        match r.code {
+            1 => SafeGoldError::MissingRequiredInformation(r.message),
+            _ => SafeGoldError::BadRequest(r.message),
+        }
+    }
+    fn handle_get_user_transactions_bad_request(r: SafeGoldClientError) -> SafeGoldError {
+        match r.code {
+            1 => SafeGoldError::MissingRequiredInformation(r.message),
+            _ => SafeGoldError::BadRequest(r.message),
+        }
+    }
     fn handle_get_invoice_bad_request(r: SafeGoldClientError) -> SafeGoldError {
         match r.code {
             1 => SafeGoldError::InvalidTransaction,
@@ -436,7 +431,6 @@ impl SafeGold {
             _ => SafeGoldError::BadRequest(r.message),
         }
     }
-
     fn handle_bad_request_error(r: SafeGoldClientError) -> SafeGoldError {
         match r.code {
             1 => SafeGoldError::MissingRequiredInformation(r.message),
@@ -584,7 +578,7 @@ mod tests {
                 .mul(Decimal::new(103, 2))
                 .round_dp_with_strategy(2, RoundingStrategy::RoundUp),
             gold_amount: Decimal::new(1, 0).round_dp_with_strategy(4, RoundingStrategy::RoundDown),
-            rate_id: buy_price_response.rate_id - 100,
+            rate_id: buy_price_response.rate_id + 1000,
         };
         let buy_verify = safegold.buy_verify(USER_ID, &buy_verify_request).await;
         assert!(buy_verify.is_err());
