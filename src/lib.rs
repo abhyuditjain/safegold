@@ -485,6 +485,10 @@ mod tests {
 
         let user_response = safegold.get_user(275566).await;
         assert!(user_response.is_err());
+        assert!(matches!(
+            user_response.err().unwrap(),
+            SafeGoldError::UserDoesNotExist(_)
+        ));
     }
 
     #[tokio::test]
@@ -819,6 +823,38 @@ mod tests {
         };
         let sell_verify = safegold.sell_verify(USER_ID, &sell_verify_request).await;
         assert!(sell_verify.is_ok());
+
+        // Rate invalid
+        let sell_verify_request = SellVerifyRequest {
+            sell_price: sell_price_response
+                .current_price
+                .round_dp_with_strategy(2, RoundingStrategy::RoundUp),
+            gold_amount: Decimal::new(1, 0).round_dp_with_strategy(4, RoundingStrategy::RoundDown),
+            rate_id: sell_price_response.rate_id - 100,
+        };
+        let sell_verify = safegold.sell_verify(USER_ID, &sell_verify_request).await;
+        assert!(sell_verify.is_err());
+        assert!(matches!(
+            sell_verify.err().unwrap(),
+            SafeGoldError::InvalidRate
+        ));
+
+        // Gold Mismatch
+        let sell_verify_request = SellVerifyRequest {
+            sell_price: sell_price_response
+                .current_price
+                .round_dp_with_strategy(2, RoundingStrategy::RoundUp),
+            gold_amount: Decimal::new(1, 0)
+                .add(Decimal::new(1, 2))
+                .round_dp_with_strategy(4, RoundingStrategy::RoundDown),
+            rate_id: sell_price_response.rate_id,
+        };
+        let sell_verify = safegold.sell_verify(USER_ID, &sell_verify_request).await;
+        assert!(sell_verify.is_err());
+        assert!(matches!(
+            sell_verify.err().unwrap(),
+            SafeGoldError::GoldAmountDoesNotMatch
+        ));
 
         // Try to sell more gold than in balance
         let sell_verify_request = SellVerifyRequest {
