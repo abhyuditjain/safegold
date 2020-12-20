@@ -7,6 +7,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_aux::prelude::deserialize_number_from_string;
 use thiserror::Error;
+use validator::{Validate, ValidationErrors};
 
 #[derive(Error, Debug)]
 pub enum SafeGoldError {
@@ -34,14 +35,29 @@ pub enum SafeGoldError {
     #[error("Gold amount does not match")]
     GoldAmountDoesNotMatch,
 
+    #[error("Insufficient Gold balance")]
+    InsufficientGoldBalance,
+
+    #[error("Gold balance above KYC Limit")]
+    BalanceAboveKYCLimit,
+
+    #[error("Gold balance above PAN Limit")]
+    BalanceAbovePANLimit,
+
     #[error("Invalid Rate")]
     InvalidRate,
+
+    #[error("SafeGold rate does not match current rate")]
+    RateMismatch,
 
     #[error("Invalid URL")]
     InvalidUrl(#[from] url::ParseError),
 
     #[error(transparent)]
     UndefinedError(#[from] reqwest::Error),
+
+    #[error("validation error: {0}")]
+    ValidationError(#[from] ValidationErrors),
 
     #[error("Service not available")]
     ServiceUnavailable,
@@ -55,8 +71,8 @@ struct SafeGoldClientError {
 
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
 pub struct KycRequirement {
-    identity_required: u8,
-    pan_required: u8,
+    pub identity_required: u8,
+    pub pan_required: u8,
 }
 
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -67,7 +83,18 @@ pub struct User {
     pincode: String,
     email: Option<String>,
     gold_balance: Decimal,
+    gstin: Option<String>,
     kyc_requirement: KycRequirement,
+}
+
+#[derive(Serialize, Deserialize, Validate, Debug, Eq, PartialEq)]
+pub struct RegisterUser {
+    name: String,
+    mobile_no: String,
+    pin_code: String,
+    #[validate(email)]
+    email: Option<String>,
+    gstin: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -80,8 +107,23 @@ pub struct BuyPrice {
 }
 
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
+pub struct SellPrice {
+    current_price: Decimal,
+    rate_id: usize,
+    #[serde(with = "utils::custom_date_time_format")]
+    rate_validity: DateTime<Utc>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
 pub struct BuyVerifyRequest {
     buy_price: Decimal,
+    gold_amount: Decimal,
+    rate_id: usize,
+}
+
+#[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
+pub struct SellVerifyRequest {
+    sell_price: Decimal,
     gold_amount: Decimal,
     rate_id: usize,
 }
@@ -99,6 +141,16 @@ pub struct BuyVerify {
     gst_amount: Decimal,
     #[serde(deserialize_with = "deserialize_number_from_string")]
     user_id: usize,
+}
+
+#[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
+pub struct SellVerify {
+    tx_id: usize,
+    #[serde(deserialize_with = "deserialize_number_from_string")]
+    rate_id: usize,
+    rate: Decimal,
+    gold_amount: Decimal,
+    sell_price: Decimal,
 }
 
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -148,6 +200,11 @@ pub struct Transaction {
     tx_date: DateTime<Utc>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
+pub struct Invoice {
+    link: String,
+}
+
 pub struct SafeGold {
     base_url: reqwest::Url,
     client: reqwest::Client,
@@ -169,16 +226,43 @@ impl SafeGold {
         })
     }
 
+    pub async fn register_user(&self, user: &RegisterUser) -> Result<User, SafeGoldError> {
+        user.validate()?;
+        let url: Url = format!("{}v1/users", self.base_url).parse()?;
+        let r = self.client.post(url).json(user).send().await?;
+        match r.status().as_u16() {
+            200 => Ok(r.json::<User>().await?),
+            400 => Err(Self::handle_register_user_bad_request(
+                r.json::<SafeGoldClientError>().await?,
+            )),
+            _ => Err(SafeGoldError::ServiceUnavailable),
+        }
+    }
+
+    fn handle_register_user_bad_request(r: SafeGoldClientError) -> SafeGoldError {
+        match r.code {
+            1 => SafeGoldError::MissingRequiredInformation(r.message),
+            _ => SafeGoldError::BadRequest(r.message),
+        }
+    }
+
     pub async fn get_user(&self, id: usize) -> Result<User, SafeGoldError> {
         let url: Url = format!("{}v1/users/{}", self.base_url, id).parse()?;
         let r = self.client.get(url).send().await?;
         match r.status().as_u16() {
             200 => Ok(r.json::<User>().await?),
-            400 => Err(Self::handle_bad_request_error(
+            400 => Err(Self::handle_get_user_bad_request(
                 r.json::<SafeGoldClientError>().await?,
             )),
             404 => Err(SafeGoldError::UserDoesNotExist(id.to_string())),
             _ => Err(SafeGoldError::ServiceUnavailable),
+        }
+    }
+
+    fn handle_get_user_bad_request(r: SafeGoldClientError) -> SafeGoldError {
+        match r.code {
+            1 => SafeGoldError::UserDoesNotExist(r.message),
+            _ => SafeGoldError::BadRequest(r.message),
         }
     }
 
@@ -187,6 +271,18 @@ impl SafeGold {
         let r = self.client.get(url).send().await?;
         match r.status().as_u16() {
             200 => Ok(r.json::<BuyPrice>().await?),
+            400 => Err(Self::handle_bad_request_error(
+                r.json::<SafeGoldClientError>().await?,
+            )),
+            _ => Err(SafeGoldError::ServiceUnavailable),
+        }
+    }
+
+    pub async fn get_sell_price(&self) -> Result<SellPrice, SafeGoldError> {
+        let url: Url = format!("{}v1/sell-price", self.base_url).parse().unwrap();
+        let r = self.client.get(url).send().await?;
+        match r.status().as_u16() {
+            200 => Ok(r.json::<SellPrice>().await?),
             400 => Err(Self::handle_bad_request_error(
                 r.json::<SafeGoldClientError>().await?,
             )),
@@ -203,10 +299,50 @@ impl SafeGold {
         let r = self.client.post(url).json(buy_verify).send().await?;
         match r.status().as_u16() {
             200 => Ok(r.json::<BuyVerify>().await?),
-            400 => Err(Self::handle_bad_request_error(
+            400 => Err(Self::handle_buy_verify_bad_request(
                 r.json::<SafeGoldClientError>().await?,
             )),
             _ => Err(SafeGoldError::ServiceUnavailable),
+        }
+    }
+
+    fn handle_buy_verify_bad_request(r: SafeGoldClientError) -> SafeGoldError {
+        match r.code {
+            1 => SafeGoldError::MissingRequiredInformation(r.message),
+            2 => SafeGoldError::RateMismatch,
+            4 => SafeGoldError::GoldAmountDoesNotMatch,
+            6 => SafeGoldError::BalanceAboveKYCLimit,
+            7 => SafeGoldError::BalanceAbovePANLimit,
+            8 => SafeGoldError::InvalidRate,
+            _ => SafeGoldError::BadRequest(r.message),
+        }
+    }
+
+    pub async fn sell_verify(
+        &self,
+        user_id: usize,
+        sell_verify: &SellVerifyRequest,
+    ) -> Result<SellVerify, SafeGoldError> {
+        let url: Url = format!("{}v4/users/{}/sell-gold-verify", self.base_url, user_id).parse()?;
+        let r = self.client.post(url).json(sell_verify).send().await?;
+        match r.status().as_u16() {
+            200 => Ok(r.json::<SellVerify>().await?),
+            400 => Err(Self::handle_sell_verify_bad_request(
+                r.json::<SafeGoldClientError>().await?,
+            )),
+            _ => Err(SafeGoldError::ServiceUnavailable),
+        }
+    }
+
+    fn handle_sell_verify_bad_request(r: SafeGoldClientError) -> SafeGoldError {
+        match r.code {
+            1 => SafeGoldError::MissingRequiredInformation(r.message),
+            2 => SafeGoldError::RateMismatch,
+            3 => SafeGoldError::UserDoesNotExist(r.message),
+            4 => SafeGoldError::InsufficientGoldBalance,
+            5 => SafeGoldError::GoldAmountDoesNotMatch,
+            6 => SafeGoldError::InvalidRate,
+            _ => SafeGoldError::BadRequest(r.message),
         }
     }
 
@@ -219,10 +355,20 @@ impl SafeGold {
         let r = self.client.post(url).json(buy_confirm).send().await?;
         match r.status().as_u16() {
             200 => Ok(r.json::<BuyConfirm>().await?),
-            400 => Err(Self::handle_bad_request_error(
+            400 => Err(Self::handle_buy_confirm_bad_request(
                 r.json::<SafeGoldClientError>().await?,
             )),
             _ => Err(SafeGoldError::ServiceUnavailable),
+        }
+    }
+
+    fn handle_buy_confirm_bad_request(r: SafeGoldClientError) -> SafeGoldError {
+        match r.code {
+            1 => SafeGoldError::MissingRequiredInformation(r.message),
+            2 => SafeGoldError::InvalidTransaction,
+            3 => SafeGoldError::VendorUserMismatch,
+            5 => SafeGoldError::UserIdMissingInTransaction,
+            _ => SafeGoldError::BadRequest(r.message),
         }
     }
 
@@ -231,11 +377,18 @@ impl SafeGold {
         let r = self.client.get(url).send().await?;
         match r.status().as_u16() {
             200 => Ok(r.json::<BuyStatus>().await?),
-            400 => Err(Self::handle_bad_request_error(
+            400 => Err(Self::handle_buy_status_bad_request(
                 r.json::<SafeGoldClientError>().await?,
             )),
             404 => Err(SafeGoldError::TransactionNotFound(tx_id)),
             _ => Err(SafeGoldError::ServiceUnavailable),
+        }
+    }
+
+    fn handle_buy_status_bad_request(r: SafeGoldClientError) -> SafeGoldError {
+        match r.code {
+            1 => SafeGoldError::MissingRequiredInformation(r.message),
+            _ => SafeGoldError::BadRequest(r.message),
         }
     }
 
@@ -249,10 +402,38 @@ impl SafeGold {
         let r = self.client.get(url).query(&[("page", page)]).send().await?;
         match r.status().as_u16() {
             200 => Ok(r.json::<TransactionList>().await?),
-            400 => Err(Self::handle_bad_request_error(
+            400 => Err(Self::handle_get_user_transactions_bad_request(
                 r.json::<SafeGoldClientError>().await?,
             )),
             _ => Err(SafeGoldError::ServiceUnavailable),
+        }
+    }
+
+    fn handle_get_user_transactions_bad_request(r: SafeGoldClientError) -> SafeGoldError {
+        match r.code {
+            1 => SafeGoldError::MissingRequiredInformation(r.message),
+            _ => SafeGoldError::BadRequest(r.message),
+        }
+    }
+
+    pub async fn get_invoice(&self, tx_id: usize) -> Result<Invoice, SafeGoldError> {
+        let url: Url =
+            format!("{}/v1/transactions/{}/fetch-invoice", self.base_url, tx_id).parse()?;
+        let r = self.client.get(url).send().await?;
+        match r.status().as_u16() {
+            200 => Ok(r.json::<Invoice>().await?),
+            400 => Err(Self::handle_get_invoice_bad_request(
+                r.json::<SafeGoldClientError>().await?,
+            )),
+            _ => Err(SafeGoldError::ServiceUnavailable),
+        }
+    }
+
+    fn handle_get_invoice_bad_request(r: SafeGoldClientError) -> SafeGoldError {
+        match r.code {
+            1 => SafeGoldError::InvalidTransaction,
+            2 => SafeGoldError::VendorUserMismatch,
+            _ => SafeGoldError::BadRequest(r.message),
         }
     }
 
@@ -271,11 +452,14 @@ impl SafeGold {
 
 #[cfg(test)]
 mod tests {
-    use crate::{BuyConfirmRequest, BuyVerifyRequest, SafeGold, SafeGoldError};
+    use crate::{
+        BuyConfirmRequest, BuyVerifyRequest, RegisterUser, SafeGold, SafeGoldError,
+        SellVerifyRequest,
+    };
     use chrono::Utc;
     use lazy_static::lazy_static;
     use rust_decimal::{Decimal, RoundingStrategy};
-    use std::ops::Mul;
+    use std::ops::{Add, Mul};
 
     const USER_ID: usize = 275567;
     const OLD_TX_ID: usize = 1288969;
@@ -301,6 +485,52 @@ mod tests {
 
         let user_response = safegold.get_user(275566).await;
         assert!(user_response.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_register_user() {
+        let safegold = SafeGold::new(&BASE_URL, &TOKEN).unwrap();
+        let user_response = safegold
+            .register_user(&RegisterUser {
+                name: "SafeGold".to_string(),
+                mobile_no: "1234567890".to_string(),
+                pin_code: "110052".to_string(),
+                email: Some("asdasda".to_string()),
+                gstin: None,
+            })
+            .await;
+        assert!(user_response.is_err());
+        assert!(matches!(
+            user_response.err().unwrap(),
+            SafeGoldError::ValidationError(_)
+        ));
+
+        // mobile_no is required
+        let user_response = safegold
+            .register_user(&RegisterUser {
+                name: "SafeGold".to_string(),
+                mobile_no: "".to_string(),
+                pin_code: "110052".to_string(),
+                email: Some("a@a.com".to_string()),
+                gstin: None,
+            })
+            .await;
+        assert!(user_response.is_err());
+        assert!(matches!(
+            user_response.err().unwrap(),
+            SafeGoldError::MissingRequiredInformation(_)
+        ));
+
+        let user_response = safegold
+            .register_user(&RegisterUser {
+                name: "SafeGold".to_string(),
+                mobile_no: "1234567890".to_string(),
+                pin_code: "110052".to_string(),
+                email: Some("a@a.com".to_string()),
+                gstin: None,
+            })
+            .await;
+        assert!(user_response.is_ok());
     }
 
     #[tokio::test]
@@ -553,5 +783,61 @@ mod tests {
         let user_transactions = user_transactions_response_page_2.unwrap();
         assert!(user_transactions.meta.previous.is_some());
         assert!(user_transactions.meta.next.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_get_invoice() {
+        let safegold = SafeGold::new(&BASE_URL, &TOKEN).unwrap();
+        let invoice_repsonse = safegold.get_invoice(1289107).await;
+        assert!(invoice_repsonse.is_ok());
+
+        let invoice_repsonse = safegold.get_invoice(12345).await;
+        assert!(invoice_repsonse.is_err());
+        assert!(matches!(
+            invoice_repsonse.err().unwrap(),
+            SafeGoldError::InvalidTransaction
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_sell_price() {
+        let safegold = SafeGold::new(&BASE_URL, &TOKEN).unwrap();
+        let sell_price_response = safegold.get_sell_price().await;
+        assert!(sell_price_response.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_sell_verify() {
+        let safegold = SafeGold::new(&BASE_URL, &TOKEN).unwrap();
+        let user = safegold.get_user(USER_ID).await.unwrap();
+        let sell_price_response = safegold.get_sell_price().await.unwrap();
+
+        let sell_verify_request = SellVerifyRequest {
+            sell_price: sell_price_response.current_price.mul(user.gold_balance),
+            gold_amount: user.gold_balance,
+            rate_id: sell_price_response.rate_id,
+        };
+        let sell_verify = safegold.sell_verify(USER_ID, &sell_verify_request).await;
+        assert!(sell_verify.is_ok());
+
+        // Try to sell more gold than in balance
+        let sell_verify_request = SellVerifyRequest {
+            sell_price: user
+                .gold_balance
+                .add(Decimal::new(100, 0))
+                .round_dp_with_strategy(0, RoundingStrategy::RoundUp)
+                .mul(sell_price_response.current_price),
+            gold_amount: user
+                .gold_balance
+                .round_dp_with_strategy(0, RoundingStrategy::RoundUp)
+                .add(Decimal::new(100, 0)),
+            rate_id: sell_price_response.rate_id,
+        };
+        let sell_verify = safegold.sell_verify(USER_ID, &sell_verify_request).await;
+        assert!(sell_verify.is_err());
+        assert!(matches!(
+            sell_verify.err().unwrap(),
+            SafeGoldError::InsufficientGoldBalance
+        ));
     }
 }
