@@ -160,7 +160,18 @@ pub struct BuyConfirmRequest {
 }
 
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
+pub struct SellConfirmRequest {
+    tx_id: usize,
+    date: NaiveDate,
+}
+
+#[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
 pub struct BuyConfirm {
+    invoice_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
+pub struct SellConfirm {
     invoice_id: String,
 }
 
@@ -324,6 +335,23 @@ impl SafeGold {
         }
     }
 
+    pub async fn sell_confirm(
+        &self,
+        user_id: usize,
+        sell_confirm: &SellConfirmRequest,
+    ) -> Result<SellConfirm, SafeGoldError> {
+        let url: Url =
+            format!("{}v1/users/{}/sell-gold-confirm", self.base_url, user_id).parse()?;
+        let r = self.client.post(url).json(sell_confirm).send().await?;
+        match r.status().as_u16() {
+            200 => Ok(r.json::<SellConfirm>().await?),
+            400 => Err(Self::handle_sell_confirm_bad_request(
+                r.json::<SafeGoldClientError>().await?,
+            )),
+            _ => Err(SafeGoldError::ServiceUnavailable),
+        }
+    }
+
     pub async fn buy_status(&self, tx_id: usize) -> Result<BuyStatus, SafeGoldError> {
         let url: Url = format!("{}v1/buy-gold/{}/order-status", self.base_url, tx_id).parse()?;
         let r = self.client.get(url).send().await?;
@@ -412,6 +440,15 @@ impl SafeGold {
             _ => SafeGoldError::BadRequest(r.message),
         }
     }
+    fn handle_sell_confirm_bad_request(r: SafeGoldClientError) -> SafeGoldError {
+        match r.code {
+            1 => SafeGoldError::MissingRequiredInformation(r.message),
+            2 => SafeGoldError::InvalidTransaction,
+            3 => SafeGoldError::UserIdMissingInTransaction,
+            7 => SafeGoldError::InsufficientGoldBalance,
+            _ => SafeGoldError::BadRequest(r.message),
+        }
+    }
     fn handle_buy_status_bad_request(r: SafeGoldClientError) -> SafeGoldError {
         match r.code {
             1 => SafeGoldError::MissingRequiredInformation(r.message),
@@ -448,7 +485,7 @@ impl SafeGold {
 mod tests {
     use crate::{
         BuyConfirmRequest, BuyVerifyRequest, RegisterUser, SafeGold, SafeGoldError,
-        SellVerifyRequest,
+        SellConfirmRequest, SellVerifyRequest,
     };
     use chrono::Utc;
     use lazy_static::lazy_static;
@@ -589,6 +626,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_sell_verify() {
+        let safegold = SafeGold::new(&BASE_URL, &TOKEN).unwrap();
+        let user = safegold.get_user(USER_ID).await.unwrap();
+        let sell_price_response = safegold.get_sell_price().await.unwrap();
+
+        let sell_verify_request = SellVerifyRequest {
+            sell_price: sell_price_response.current_price.mul(user.gold_balance),
+            gold_amount: user.gold_balance,
+            rate_id: sell_price_response.rate_id,
+        };
+        let sell_verify = safegold.sell_verify(USER_ID, &sell_verify_request).await;
+        assert!(sell_verify.is_ok());
+
+        // Rate invalid
+        let sell_verify_request = SellVerifyRequest {
+            sell_price: sell_price_response
+                .current_price
+                .round_dp_with_strategy(2, RoundingStrategy::RoundUp),
+            gold_amount: Decimal::new(1, 0).round_dp_with_strategy(4, RoundingStrategy::RoundDown),
+            rate_id: sell_price_response.rate_id - 100,
+        };
+        let sell_verify = safegold.sell_verify(USER_ID, &sell_verify_request).await;
+        assert!(sell_verify.is_err());
+        assert!(matches!(
+            sell_verify.err().unwrap(),
+            SafeGoldError::InvalidRate
+        ));
+
+        // Gold Mismatch
+        let sell_verify_request = SellVerifyRequest {
+            sell_price: sell_price_response
+                .current_price
+                .round_dp_with_strategy(2, RoundingStrategy::RoundUp),
+            gold_amount: Decimal::new(1, 0)
+                .add(Decimal::new(1, 2))
+                .round_dp_with_strategy(4, RoundingStrategy::RoundDown),
+            rate_id: sell_price_response.rate_id,
+        };
+        let sell_verify = safegold.sell_verify(USER_ID, &sell_verify_request).await;
+        assert!(sell_verify.is_err());
+        assert!(matches!(
+            sell_verify.err().unwrap(),
+            SafeGoldError::GoldAmountDoesNotMatch
+        ));
+
+        // Try to sell more gold than in balance
+        let sell_verify_request = SellVerifyRequest {
+            sell_price: user
+                .gold_balance
+                .add(Decimal::new(100, 0))
+                .round_dp_with_strategy(0, RoundingStrategy::RoundUp)
+                .mul(sell_price_response.current_price),
+            gold_amount: user
+                .gold_balance
+                .round_dp_with_strategy(0, RoundingStrategy::RoundUp)
+                .add(Decimal::new(100, 0)),
+            rate_id: sell_price_response.rate_id,
+        };
+        let sell_verify = safegold.sell_verify(USER_ID, &sell_verify_request).await;
+        assert!(sell_verify.is_err());
+        assert!(matches!(
+            sell_verify.err().unwrap(),
+            SafeGoldError::InsufficientGoldBalance
+        ));
+    }
+
+    #[tokio::test]
     async fn test_buy_confirm() {
         let safegold = SafeGold::new(&BASE_URL, &TOKEN).unwrap();
         let buy_price_response = safegold.get_buy_price().await.unwrap();
@@ -662,6 +766,102 @@ mod tests {
         assert!(matches!(
             buy_confirm.unwrap_err(),
             SafeGoldError::UserIdMissingInTransaction
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_sell_confirm() {
+        let safegold = SafeGold::new(&BASE_URL, &TOKEN).unwrap();
+        let sell_price_response = safegold.get_sell_price().await.unwrap();
+        let sell_verify = safegold
+            .sell_verify(
+                USER_ID,
+                &SellVerifyRequest {
+                    sell_price: sell_price_response.current_price,
+                    gold_amount: Decimal::new(1, 0),
+                    rate_id: sell_price_response.rate_id,
+                },
+            )
+            .await
+            .unwrap();
+
+        let sell_confirm_request = SellConfirmRequest {
+            date: Utc::now().naive_utc().date(),
+            tx_id: sell_verify.tx_id,
+        };
+        let sell_confirm = safegold.sell_confirm(USER_ID, &sell_confirm_request).await;
+        assert!(sell_confirm.is_ok());
+
+        let sell_confirm_request = SellConfirmRequest {
+            date: Utc::now().naive_utc().date(),
+            tx_id: 11111111111,
+        };
+        let sell_confirm = safegold.sell_confirm(USER_ID, &sell_confirm_request).await;
+        assert!(sell_confirm.is_err());
+        assert!(matches!(
+            sell_confirm.unwrap_err(),
+            SafeGoldError::InvalidTransaction
+        ));
+
+        let sell_confirm_request = SellConfirmRequest {
+            date: Utc::now().naive_utc().date(),
+            tx_id: sell_verify.tx_id,
+        };
+        let sell_confirm = safegold.sell_confirm(12345, &sell_confirm_request).await;
+        assert!(sell_confirm.is_err());
+        assert!(matches!(
+            sell_confirm.unwrap_err(),
+            SafeGoldError::UserIdMissingInTransaction
+        ));
+
+        // Gold balance lower than sell amount
+        // To test this, we must create two requests
+        // If we only create one request with gold amount higher than the balance,
+        // the request will fail in SellVerify call
+        let user = safegold.get_user(USER_ID).await.unwrap();
+        let sell_verify_1 = safegold
+            .sell_verify(
+                USER_ID,
+                &SellVerifyRequest {
+                    sell_price: sell_price_response.current_price,
+                    gold_amount: Decimal::new(1, 0),
+                    rate_id: sell_price_response.rate_id,
+                },
+            )
+            .await
+            .unwrap();
+        let sell_verify_2 = safegold
+            .sell_verify(
+                USER_ID,
+                &SellVerifyRequest {
+                    sell_price: sell_price_response.current_price.mul(user.gold_balance),
+                    gold_amount: user.gold_balance,
+                    rate_id: sell_price_response.rate_id,
+                },
+            )
+            .await
+            .unwrap();
+        // 1st should pass
+        let sell_confirm_request_1 = SellConfirmRequest {
+            date: Utc::now().naive_utc().date(),
+            tx_id: sell_verify_1.tx_id,
+        };
+        let sell_confirm_1 = safegold
+            .sell_confirm(USER_ID, &sell_confirm_request_1)
+            .await;
+        assert!(sell_confirm_1.is_ok());
+        // 2nd should fail
+        let sell_confirm_request_2 = SellConfirmRequest {
+            date: Utc::now().naive_utc().date(),
+            tx_id: sell_verify_2.tx_id,
+        };
+        let sell_confirm_2 = safegold
+            .sell_confirm(USER_ID, &sell_confirm_request_2)
+            .await;
+        assert!(sell_confirm_2.is_err());
+        assert!(matches!(
+            sell_confirm_2.unwrap_err(),
+            SafeGoldError::InsufficientGoldBalance
         ));
     }
 
@@ -802,72 +1002,5 @@ mod tests {
         let safegold = SafeGold::new(&BASE_URL, &TOKEN).unwrap();
         let sell_price_response = safegold.get_sell_price().await;
         assert!(sell_price_response.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_sell_verify() {
-        let safegold = SafeGold::new(&BASE_URL, &TOKEN).unwrap();
-        let user = safegold.get_user(USER_ID).await.unwrap();
-        let sell_price_response = safegold.get_sell_price().await.unwrap();
-
-        let sell_verify_request = SellVerifyRequest {
-            sell_price: sell_price_response.current_price.mul(user.gold_balance),
-            gold_amount: user.gold_balance,
-            rate_id: sell_price_response.rate_id,
-        };
-        let sell_verify = safegold.sell_verify(USER_ID, &sell_verify_request).await;
-        assert!(sell_verify.is_ok());
-
-        // Rate invalid
-        let sell_verify_request = SellVerifyRequest {
-            sell_price: sell_price_response
-                .current_price
-                .round_dp_with_strategy(2, RoundingStrategy::RoundUp),
-            gold_amount: Decimal::new(1, 0).round_dp_with_strategy(4, RoundingStrategy::RoundDown),
-            rate_id: sell_price_response.rate_id - 100,
-        };
-        let sell_verify = safegold.sell_verify(USER_ID, &sell_verify_request).await;
-        assert!(sell_verify.is_err());
-        assert!(matches!(
-            sell_verify.err().unwrap(),
-            SafeGoldError::InvalidRate
-        ));
-
-        // Gold Mismatch
-        let sell_verify_request = SellVerifyRequest {
-            sell_price: sell_price_response
-                .current_price
-                .round_dp_with_strategy(2, RoundingStrategy::RoundUp),
-            gold_amount: Decimal::new(1, 0)
-                .add(Decimal::new(1, 2))
-                .round_dp_with_strategy(4, RoundingStrategy::RoundDown),
-            rate_id: sell_price_response.rate_id,
-        };
-        let sell_verify = safegold.sell_verify(USER_ID, &sell_verify_request).await;
-        assert!(sell_verify.is_err());
-        assert!(matches!(
-            sell_verify.err().unwrap(),
-            SafeGoldError::GoldAmountDoesNotMatch
-        ));
-
-        // Try to sell more gold than in balance
-        let sell_verify_request = SellVerifyRequest {
-            sell_price: user
-                .gold_balance
-                .add(Decimal::new(100, 0))
-                .round_dp_with_strategy(0, RoundingStrategy::RoundUp)
-                .mul(sell_price_response.current_price),
-            gold_amount: user
-                .gold_balance
-                .round_dp_with_strategy(0, RoundingStrategy::RoundUp)
-                .add(Decimal::new(100, 0)),
-            rate_id: sell_price_response.rate_id,
-        };
-        let sell_verify = safegold.sell_verify(USER_ID, &sell_verify_request).await;
-        assert!(sell_verify.is_err());
-        assert!(matches!(
-            sell_verify.err().unwrap(),
-            SafeGoldError::InsufficientGoldBalance
-        ));
     }
 }
