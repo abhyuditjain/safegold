@@ -185,6 +185,16 @@ pub struct BuyStatus {
 }
 
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
+pub struct SellStatus {
+    status: usize,
+    settled_status: usize,
+    invoice_id: Option<String>,
+    bank_reference_number: String,
+    #[serde(with = "utils::custom_date_time_format")]
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
 pub struct TransactionList {
     transactions: Vec<Transaction>,
     meta: TransactionListMeta,
@@ -365,6 +375,19 @@ impl SafeGold {
         }
     }
 
+    pub async fn sell_status(&self, tx_id: usize) -> Result<SellStatus, SafeGoldError> {
+        let url: Url = format!("{}v1/sell-gold/{}/order-status", self.base_url, tx_id).parse()?;
+        let r = self.client.get(url).send().await?;
+        match r.status().as_u16() {
+            200 => Ok(r.json::<SellStatus>().await?),
+            400 => Err(Self::handle_sell_status_bad_request(
+                r.json::<SafeGoldClientError>().await?,
+            )),
+            404 => Err(SafeGoldError::TransactionNotFound(tx_id)),
+            _ => Err(SafeGoldError::ServiceUnavailable),
+        }
+    }
+
     pub async fn get_user_transactions(
         &self,
         user_id: usize,
@@ -455,6 +478,12 @@ impl SafeGold {
             _ => SafeGoldError::BadRequest(r.message),
         }
     }
+    fn handle_sell_status_bad_request(r: SafeGoldClientError) -> SafeGoldError {
+        match r.code {
+            1 => SafeGoldError::InvalidTransaction,
+            _ => SafeGoldError::BadRequest(r.message),
+        }
+    }
     fn handle_get_user_transactions_bad_request(r: SafeGoldClientError) -> SafeGoldError {
         match r.code {
             1 => SafeGoldError::MissingRequiredInformation(r.message),
@@ -493,7 +522,8 @@ mod tests {
     use std::ops::{Add, Mul};
 
     const USER_ID: usize = 275567;
-    const OLD_TX_ID: usize = 1288969;
+    const OLD_BUY_TX_ID: usize = 1288969;
+    const OLD_SELL_TX_ID: usize = 1289253;
 
     lazy_static! {
         static ref BASE_URL: String = std::env::var("BASE_URL").unwrap();
@@ -908,13 +938,13 @@ mod tests {
             .buy_confirm(
                 USER_ID,
                 &BuyConfirmRequest {
-                    tx_id: OLD_TX_ID,
+                    tx_id: OLD_BUY_TX_ID,
                     date: Utc::now().naive_utc().date(),
                 },
             )
             .await;
         assert!(buy_confirm.is_err());
-        let buy_status_response = safegold.buy_status(OLD_TX_ID).await;
+        let buy_status_response = safegold.buy_status(OLD_BUY_TX_ID).await;
         assert!(buy_status_response.is_ok());
         assert_eq!(buy_status_response.unwrap().status, 2);
 
@@ -922,6 +952,63 @@ mod tests {
         assert!(buy_status_response.is_err());
         assert!(matches!(
             buy_status_response.err().unwrap(),
+            SafeGoldError::TransactionNotFound(11111111)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_sell_status() {
+        let safegold = SafeGold::new(&BASE_URL, &TOKEN).unwrap();
+        let sell_price_response = safegold.get_sell_price().await.unwrap();
+        let sell_verify = safegold
+            .sell_verify(
+                USER_ID,
+                &SellVerifyRequest {
+                    sell_price: sell_price_response.current_price,
+                    gold_amount: Decimal::new(1, 0),
+                    rate_id: sell_price_response.rate_id,
+                },
+            )
+            .await
+            .unwrap();
+
+        let sell_status_response = safegold.sell_status(sell_verify.tx_id).await;
+        assert!(sell_status_response.is_ok());
+        assert_eq!(sell_status_response.unwrap().status, 0);
+
+        let _sell_confirm = safegold
+            .sell_confirm(
+                USER_ID,
+                &SellConfirmRequest {
+                    tx_id: sell_verify.tx_id,
+                    date: Utc::now().naive_utc().date(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let sell_status_response = safegold.sell_status(sell_verify.tx_id).await;
+        assert!(sell_status_response.is_ok());
+        assert_eq!(sell_status_response.unwrap().status, 1);
+
+        let sell_confirm = safegold
+            .sell_confirm(
+                USER_ID,
+                &SellConfirmRequest {
+                    tx_id: OLD_SELL_TX_ID,
+                    date: Utc::now().naive_utc().date(),
+                },
+            )
+            .await;
+        assert!(sell_confirm.is_err());
+        let sell_status_response = safegold.sell_status(OLD_SELL_TX_ID).await;
+        assert!(sell_status_response.is_ok());
+        assert_eq!(sell_status_response.unwrap().status, 2);
+
+        let sell_status_response = safegold.buy_status(11111111).await;
+        assert!(sell_status_response.is_err());
+        assert!(matches!(
+            sell_status_response.err().unwrap(),
             SafeGoldError::TransactionNotFound(11111111)
         ));
     }
