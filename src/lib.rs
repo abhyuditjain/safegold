@@ -80,7 +80,8 @@ pub struct User {
     id: usize,
     name: String,
     mobile_no: String,
-    pincode: String,
+    #[serde(deserialize_with = "deserialize_number_from_string")]
+    pincode: usize,
     email: Option<String>,
     gold_balance: Decimal,
     gstin: Option<String>,
@@ -91,7 +92,7 @@ pub struct User {
 pub struct RegisterUser {
     name: String,
     mobile_no: String,
-    pin_code: String,
+    pin_code: usize,
     #[validate(email)]
     email: Option<String>,
     gstin: Option<String>,
@@ -224,6 +225,19 @@ pub struct Transaction {
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
 pub struct Invoice {
     link: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
+pub struct ValidatePincodeRequest {
+    pin_code: usize,
+}
+
+#[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
+pub struct PincodeStatus {
+    status: usize,
+    pin_code: Option<usize>,
+    city: Option<String>,
+    state: Option<String>,
 }
 
 pub struct SafeGold {
@@ -417,6 +431,21 @@ impl SafeGold {
             _ => Err(SafeGoldError::ServiceUnavailable),
         }
     }
+
+    pub async fn validate_pincode(
+        &self,
+        pincode_request: &ValidatePincodeRequest,
+    ) -> Result<PincodeStatus, SafeGoldError> {
+        let url: Url = format!("{}v1/validate-pincode", self.base_url).parse()?;
+        let r = self.client.post(url).json(pincode_request).send().await?;
+        match r.status().as_u16() {
+            200 => Ok(r.json::<PincodeStatus>().await?),
+            400 => Err(Self::handle_validate_pincode_bad_request(
+                r.json::<SafeGoldClientError>().await?,
+            )),
+            _ => Err(SafeGoldError::ServiceUnavailable),
+        }
+    }
 }
 
 impl SafeGold {
@@ -508,13 +537,19 @@ impl SafeGold {
             _ => SafeGoldError::BadRequest(r.message),
         }
     }
+    fn handle_validate_pincode_bad_request(r: SafeGoldClientError) -> SafeGoldError {
+        match r.code {
+            1 => SafeGoldError::MissingRequiredInformation(r.message),
+            _ => SafeGoldError::BadRequest(r.message),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::{
         BuyConfirmRequest, BuyVerifyRequest, RegisterUser, SafeGold, SafeGoldError,
-        SellConfirmRequest, SellVerifyRequest,
+        SellConfirmRequest, SellVerifyRequest, ValidatePincodeRequest,
     };
     use chrono::Utc;
     use lazy_static::lazy_static;
@@ -559,7 +594,7 @@ mod tests {
             .register_user(&RegisterUser {
                 name: "SafeGold".to_string(),
                 mobile_no: "1234567890".to_string(),
-                pin_code: "110052".to_string(),
+                pin_code: 110052,
                 email: Some("asdasda".to_string()),
                 gstin: None,
             })
@@ -575,7 +610,7 @@ mod tests {
             .register_user(&RegisterUser {
                 name: "SafeGold".to_string(),
                 mobile_no: "".to_string(),
-                pin_code: "110052".to_string(),
+                pin_code: 110052,
                 email: Some("a@a.com".to_string()),
                 gstin: None,
             })
@@ -590,7 +625,7 @@ mod tests {
             .register_user(&RegisterUser {
                 name: "SafeGold".to_string(),
                 mobile_no: "1234567890".to_string(),
-                pin_code: "110052".to_string(),
+                pin_code: 110052,
                 email: Some("a@a.com".to_string()),
                 gstin: None,
             })
@@ -1089,5 +1124,29 @@ mod tests {
         let safegold = SafeGold::new(&BASE_URL, &TOKEN).unwrap();
         let sell_price_response = safegold.get_sell_price().await;
         assert!(sell_price_response.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_validate_pincode() {
+        let safegold = SafeGold::new(&BASE_URL, &TOKEN).unwrap();
+        let pincode_status = safegold
+            .validate_pincode(&ValidatePincodeRequest { pin_code: 110052 })
+            .await;
+        assert!(pincode_status.is_ok());
+        let pincode_status = pincode_status.unwrap();
+        assert_eq!(pincode_status.status, 1);
+        assert_eq!(pincode_status.city, Some("Ashok vihar".to_string()));
+        assert_eq!(pincode_status.state, Some("Delhi".to_string()));
+        assert_eq!(pincode_status.pin_code, Some(110052));
+
+        let pincode_status = safegold
+            .validate_pincode(&ValidatePincodeRequest { pin_code: 0 })
+            .await;
+        assert!(pincode_status.is_ok());
+        let pincode_status = pincode_status.unwrap();
+        assert_eq!(pincode_status.status, 0);
+        assert_eq!(pincode_status.city, None);
+        assert_eq!(pincode_status.state, None);
+        assert_eq!(pincode_status.pin_code, None);
     }
 }
