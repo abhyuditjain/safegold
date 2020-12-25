@@ -240,6 +240,33 @@ pub struct PincodeStatus {
     state: Option<String>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
+pub struct ProductMedia {
+    images: Vec<String>,
+    videos: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
+pub struct GoldProduct {
+    id: usize,
+    in_stock: char,
+    sku_number: Option<String>,
+    media: Option<ProductMedia>,
+    description: Option<String>,
+    metal_weight: usize,
+    metal_stamp: Option<String>,
+    brand: Option<String>,
+    delivery_minting_cost: usize,
+    estimated_days_for_dispatch: usize,
+    product_dimensions: Option<String>,
+    product_thickness: Option<String>,
+    certification: Option<String>,
+    packaging: Option<String>,
+    metal: Option<String>,
+    refund_policy: Option<String>,
+    product_highlights: Option<String>,
+}
+
 pub struct SafeGold {
     base_url: reqwest::Url,
     client: reqwest::Client,
@@ -441,6 +468,18 @@ impl SafeGold {
         match r.status().as_u16() {
             200 => Ok(r.json::<PincodeStatus>().await?),
             400 => Err(Self::handle_validate_pincode_bad_request(
+                r.json::<SafeGoldClientError>().await?,
+            )),
+            _ => Err(SafeGoldError::ServiceUnavailable),
+        }
+    }
+
+    pub async fn get_gold_products(&self) -> Result<Vec<GoldProduct>, SafeGoldError> {
+        let url: Url = format!("{}v1/gold-products", self.base_url).parse()?;
+        let r = self.client.get(url).send().await?;
+        match r.status().as_u16() {
+            200 => Ok(r.json::<Vec<GoldProduct>>().await?),
+            400 => Err(Self::handle_bad_request_error(
                 r.json::<SafeGoldClientError>().await?,
             )),
             _ => Err(SafeGoldError::ServiceUnavailable),
@@ -1148,5 +1187,12 @@ mod tests {
         assert_eq!(pincode_status.city, None);
         assert_eq!(pincode_status.state, None);
         assert_eq!(pincode_status.pin_code, None);
+    }
+
+    #[tokio::test]
+    async fn test_get_gold_products() {
+        let safegold = SafeGold::new(&BASE_URL, &TOKEN).unwrap();
+        let gold_products_response = safegold.get_gold_products().await;
+        assert!(gold_products_response.is_ok());
     }
 }
