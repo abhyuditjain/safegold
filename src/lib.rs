@@ -50,6 +50,12 @@ pub enum SafeGoldError {
     #[error("SafeGold rate does not match current rate")]
     RateMismatch,
 
+    #[error("Invalid product code")]
+    InvalidProductCode,
+
+    #[error("Product out of stock")]
+    ProductOutOfStock,
+
     #[error("Invalid URL")]
     InvalidUrl(#[from] url::ParseError),
 
@@ -265,6 +271,30 @@ pub struct GoldProduct {
     metal: Option<String>,
     refund_policy: Option<String>,
     product_highlights: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
+pub struct Address {
+    state: String,
+    city: String,
+    address: String,
+    pincode: usize,
+    landmark: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
+pub struct RedeemVerifyRequest {
+    product_code: usize,
+    name: Option<String>,
+    phone_no: Option<usize>,
+    address: Address,
+}
+
+#[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
+pub struct RedeemVerify {
+    tx_id: usize,
+    estimated_dispatch: usize,
+    price: usize,
 }
 
 pub struct SafeGold {
@@ -485,6 +515,23 @@ impl SafeGold {
             _ => Err(SafeGoldError::ServiceUnavailable),
         }
     }
+
+    pub async fn redeem_verify(
+        &self,
+        user_id: usize,
+        redeem_verify: &RedeemVerifyRequest,
+    ) -> Result<RedeemVerify, SafeGoldError> {
+        let url: Url =
+            format!("{}v1/users/{}/redeem-gold-verify", self.base_url, user_id).parse()?;
+        let r = self.client.post(url).json(redeem_verify).send().await?;
+        match r.status().as_u16() {
+            200 => Ok(r.json::<RedeemVerify>().await?),
+            400 => Err(Self::handle_redeem_verify_bad_request(
+                r.json::<SafeGoldClientError>().await?,
+            )),
+            _ => Err(SafeGoldError::ServiceUnavailable),
+        }
+    }
 }
 
 impl SafeGold {
@@ -582,13 +629,23 @@ impl SafeGold {
             _ => SafeGoldError::BadRequest(r.message),
         }
     }
+    fn handle_redeem_verify_bad_request(r: SafeGoldClientError) -> SafeGoldError {
+        match r.code {
+            1 => SafeGoldError::MissingRequiredInformation(r.message),
+            2 => SafeGoldError::InvalidProductCode,
+            4 => SafeGoldError::ProductOutOfStock,
+            5 => SafeGoldError::UserDoesNotExist(r.message),
+            7 => SafeGoldError::InsufficientGoldBalance,
+            _ => SafeGoldError::BadRequest(r.message),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::{
-        BuyConfirmRequest, BuyVerifyRequest, RegisterUser, SafeGold, SafeGoldError,
-        SellConfirmRequest, SellVerifyRequest, ValidatePincodeRequest,
+        Address, BuyConfirmRequest, BuyVerifyRequest, RedeemVerifyRequest, RegisterUser, SafeGold,
+        SafeGoldError, SellConfirmRequest, SellVerifyRequest, ValidatePincodeRequest,
     };
     use chrono::Utc;
     use lazy_static::lazy_static;
@@ -1194,5 +1251,51 @@ mod tests {
         let safegold = SafeGold::new(&BASE_URL, &TOKEN).unwrap();
         let gold_products_response = safegold.get_gold_products().await;
         assert!(gold_products_response.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_redeem_verify() {
+        let safegold = SafeGold::new(&BASE_URL, &TOKEN).unwrap();
+        let redeem_verify_request = RedeemVerifyRequest {
+            product_code: 1,
+            name: None,
+            phone_no: None,
+            address: Address {
+                state: "".to_string(),
+                city: "".to_string(),
+                address: "".to_string(),
+                pincode: 0,
+                landmark: None,
+            },
+        };
+        let redeem_verify_response = safegold
+            .redeem_verify(USER_ID, &redeem_verify_request)
+            .await;
+        assert!(redeem_verify_response.is_err());
+        assert!(matches!(
+            redeem_verify_response.err().unwrap(),
+            SafeGoldError::MissingRequiredInformation(_)
+        ));
+
+        let redeem_verify_request = RedeemVerifyRequest {
+            product_code: 1,
+            name: None,
+            phone_no: None,
+            address: Address {
+                state: "Delhi".to_string(),
+                city: "Ashok Vihar".to_string(),
+                address: "asdadada".to_string(),
+                pincode: 110052,
+                landmark: None,
+            },
+        };
+        let redeem_verify_response = safegold
+            .redeem_verify(USER_ID, &redeem_verify_request)
+            .await;
+        assert!(redeem_verify_response.is_err());
+        assert!(matches!(
+            redeem_verify_response.err().unwrap(),
+            SafeGoldError::InvalidProductCode,
+        ));
     }
 }
